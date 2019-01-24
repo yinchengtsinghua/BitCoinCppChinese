@@ -1,0 +1,729 @@
+
+//此源码被清华学神尹成大魔王专业翻译分析并修改
+//尹成QQ77025077
+//尹成微信18510341407
+//尹成所在QQ群721929980
+//尹成邮箱 yinc13@mails.tsinghua.edu.cn
+//尹成毕业于清华大学,微软区块链领域全球最有价值专家
+//https://mvp.microsoft.com/zh-cn/PublicProfile/4033620
+//版权所有（c）2009-2010 Satoshi Nakamoto
+//版权所有（c）2009-2018比特币核心开发者
+//根据MIT软件许可证分发，请参见随附的
+//文件复制或http://www.opensource.org/licenses/mit-license.php。
+
+#include <netaddress.h>
+#include <hash.h>
+#include <util/strencodings.h>
+#include <tinyformat.h>
+
+static const unsigned char pchIPv4[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+static const unsigned char pchOnionCat[] = {0xFD,0x87,0xD8,0x7E,0xEB,0x43};
+
+//0xfd+sha256（“比特币”）[0:5]
+static const unsigned char g_internal_prefix[] = { 0xFD, 0x6B, 0x88, 0xC0, 0x87, 0x24 };
+
+CNetAddr::CNetAddr()
+{
+    memset(ip, 0, sizeof(ip));
+}
+
+void CNetAddr::SetIP(const CNetAddr& ipIn)
+{
+    memcpy(ip, ipIn.ip, sizeof(ip));
+}
+
+void CNetAddr::SetRaw(Network network, const uint8_t *ip_in)
+{
+    switch(network)
+    {
+        case NET_IPV4:
+            memcpy(ip, pchIPv4, 12);
+            memcpy(ip+12, ip_in, 4);
+            break;
+        case NET_IPV6:
+            memcpy(ip, ip_in, 16);
+            break;
+        default:
+            assert(!"invalid network");
+    }
+}
+
+bool CNetAddr::SetInternal(const std::string &name)
+{
+    if (name.empty()) {
+        return false;
+    }
+    unsigned char hash[32] = {};
+    CSHA256().Write((const unsigned char*)name.data(), name.size()).Finalize(hash);
+    memcpy(ip, g_internal_prefix, sizeof(g_internal_prefix));
+    memcpy(ip + sizeof(g_internal_prefix), hash, sizeof(ip) - sizeof(g_internal_prefix));
+    return true;
+}
+
+bool CNetAddr::SetSpecial(const std::string &strName)
+{
+    if (strName.size()>6 && strName.substr(strName.size() - 6, 6) == ".onion") {
+        std::vector<unsigned char> vchAddr = DecodeBase32(strName.substr(0, strName.size() - 6).c_str());
+        if (vchAddr.size() != 16-sizeof(pchOnionCat))
+            return false;
+        memcpy(ip, pchOnionCat, sizeof(pchOnionCat));
+        for (unsigned int i=0; i<16-sizeof(pchOnionCat); i++)
+            ip[i + sizeof(pchOnionCat)] = vchAddr[i];
+        return true;
+    }
+    return false;
+}
+
+CNetAddr::CNetAddr(const struct in_addr& ipv4Addr)
+{
+    SetRaw(NET_IPV4, (const uint8_t*)&ipv4Addr);
+}
+
+CNetAddr::CNetAddr(const struct in6_addr& ipv6Addr, const uint32_t scope)
+{
+    SetRaw(NET_IPV6, (const uint8_t*)&ipv6Addr);
+    scopeId = scope;
+}
+
+unsigned int CNetAddr::GetByte(int n) const
+{
+    return ip[15-n];
+}
+
+bool CNetAddr::IsBindAny() const
+{
+    const int cmplen = IsIPv4() ? 4 : 16;
+    for (int i = 0; i < cmplen; ++i) {
+        if (GetByte(i)) return false;
+    }
+
+    return true;
+}
+
+bool CNetAddr::IsIPv4() const
+{
+    return (memcmp(ip, pchIPv4, sizeof(pchIPv4)) == 0);
+}
+
+bool CNetAddr::IsIPv6() const
+{
+    return (!IsIPv4() && !IsTor() && !IsInternal());
+}
+
+bool CNetAddr::IsRFC1918() const
+{
+    return IsIPv4() && (
+        GetByte(3) == 10 ||
+        (GetByte(3) == 192 && GetByte(2) == 168) ||
+        (GetByte(3) == 172 && (GetByte(2) >= 16 && GetByte(2) <= 31)));
+}
+
+bool CNetAddr::IsRFC2544() const
+{
+    return IsIPv4() && GetByte(3) == 198 && (GetByte(2) == 18 || GetByte(2) == 19);
+}
+
+bool CNetAddr::IsRFC3927() const
+{
+    return IsIPv4() && (GetByte(3) == 169 && GetByte(2) == 254);
+}
+
+bool CNetAddr::IsRFC6598() const
+{
+    return IsIPv4() && GetByte(3) == 100 && GetByte(2) >= 64 && GetByte(2) <= 127;
+}
+
+bool CNetAddr::IsRFC5737() const
+{
+    return IsIPv4() && ((GetByte(3) == 192 && GetByte(2) == 0 && GetByte(1) == 2) ||
+        (GetByte(3) == 198 && GetByte(2) == 51 && GetByte(1) == 100) ||
+        (GetByte(3) == 203 && GetByte(2) == 0 && GetByte(1) == 113));
+}
+
+bool CNetAddr::IsRFC3849() const
+{
+    return GetByte(15) == 0x20 && GetByte(14) == 0x01 && GetByte(13) == 0x0D && GetByte(12) == 0xB8;
+}
+
+bool CNetAddr::IsRFC3964() const
+{
+    return (GetByte(15) == 0x20 && GetByte(14) == 0x02);
+}
+
+bool CNetAddr::IsRFC6052() const
+{
+    static const unsigned char pchRFC6052[] = {0,0x64,0xFF,0x9B,0,0,0,0,0,0,0,0};
+    return (memcmp(ip, pchRFC6052, sizeof(pchRFC6052)) == 0);
+}
+
+bool CNetAddr::IsRFC4380() const
+{
+    return (GetByte(15) == 0x20 && GetByte(14) == 0x01 && GetByte(13) == 0 && GetByte(12) == 0);
+}
+
+bool CNetAddr::IsRFC4862() const
+{
+    static const unsigned char pchRFC4862[] = {0xFE,0x80,0,0,0,0,0,0};
+    return (memcmp(ip, pchRFC4862, sizeof(pchRFC4862)) == 0);
+}
+
+bool CNetAddr::IsRFC4193() const
+{
+    return ((GetByte(15) & 0xFE) == 0xFC);
+}
+
+bool CNetAddr::IsRFC6145() const
+{
+    static const unsigned char pchRFC6145[] = {0,0,0,0,0,0,0,0,0xFF,0xFF,0,0};
+    return (memcmp(ip, pchRFC6145, sizeof(pchRFC6145)) == 0);
+}
+
+bool CNetAddr::IsRFC4843() const
+{
+    return (GetByte(15) == 0x20 && GetByte(14) == 0x01 && GetByte(13) == 0x00 && (GetByte(12) & 0xF0) == 0x10);
+}
+
+bool CNetAddr::IsTor() const
+{
+    return (memcmp(ip, pchOnionCat, sizeof(pchOnionCat)) == 0);
+}
+
+bool CNetAddr::IsLocal() const
+{
+//IPv4回送
+   if (IsIPv4() && (GetByte(3) == 127 || GetByte(3) == 0))
+       return true;
+
+//IPv6环回（：：1/128）
+   static const unsigned char pchLocal[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+   if (memcmp(ip, pchLocal, 16) == 0)
+       return true;
+
+   return false;
+}
+
+bool CNetAddr::IsValid() const
+{
+//清除大小字段中垃圾导致的3字节移位地址
+//0.2.9校验和之前版本的addr消息。
+//两个连续的addr消息如下：
+//header20 vectorlen3 addr26 addr26 addr26 header20 vectorlen3 addr26 addr26 addr26…
+//因此，如果第一个长度字段有误，它将读取第二批
+//地址偏移了3个字节。
+    if (memcmp(ip, pchIPv4+3, sizeof(pchIPv4)-3) == 0)
+        return false;
+
+//未指定的IPv6地址（：/128）
+    unsigned char ipNone6[16] = {};
+    if (memcmp(ip, ipNone6, 16) == 0)
+        return false;
+
+//文档ipv6地址
+    if (IsRFC3849())
+        return false;
+
+    if (IsInternal())
+        return false;
+
+    if (IsIPv4())
+    {
+//英达德罗无
+        uint32_t ipNone = INADDR_NONE;
+        if (memcmp(ip+12, &ipNone, 4) == 0)
+            return false;
+
+//零
+        ipNone = 0;
+        if (memcmp(ip+12, &ipNone, 4) == 0)
+            return false;
+    }
+
+    return true;
+}
+
+bool CNetAddr::IsRoutable() const
+{
+    return IsValid() && !(IsRFC1918() || IsRFC2544() || IsRFC3927() || IsRFC4862() || IsRFC6598() || IsRFC5737() || (IsRFC4193() && !IsTor()) || IsRFC4843() || IsLocal() || IsInternal());
+}
+
+bool CNetAddr::IsInternal() const
+{
+   return memcmp(ip, g_internal_prefix, sizeof(g_internal_prefix)) == 0;
+}
+
+enum Network CNetAddr::GetNetwork() const
+{
+    if (IsInternal())
+        return NET_INTERNAL;
+
+    if (!IsRoutable())
+        return NET_UNROUTABLE;
+
+    if (IsIPv4())
+        return NET_IPV4;
+
+    if (IsTor())
+        return NET_ONION;
+
+    return NET_IPV6;
+}
+
+std::string CNetAddr::ToStringIP() const
+{
+    if (IsTor())
+        return EncodeBase32(&ip[6], 10) + ".onion";
+    if (IsInternal())
+        return EncodeBase32(ip + sizeof(g_internal_prefix), sizeof(ip) - sizeof(g_internal_prefix)) + ".internal";
+    CService serv(*this, 0);
+    struct sockaddr_storage sockaddr;
+    socklen_t socklen = sizeof(sockaddr);
+    if (serv.GetSockAddr((struct sockaddr*)&sockaddr, &socklen)) {
+        char name[1025] = "";
+        if (!getnameinfo((const struct sockaddr*)&sockaddr, socklen, name, sizeof(name), nullptr, 0, NI_NUMERICHOST))
+            return std::string(name);
+    }
+    if (IsIPv4())
+        return strprintf("%u.%u.%u.%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0));
+    else
+        return strprintf("%x:%x:%x:%x:%x:%x:%x:%x",
+                         GetByte(15) << 8 | GetByte(14), GetByte(13) << 8 | GetByte(12),
+                         GetByte(11) << 8 | GetByte(10), GetByte(9) << 8 | GetByte(8),
+                         GetByte(7) << 8 | GetByte(6), GetByte(5) << 8 | GetByte(4),
+                         GetByte(3) << 8 | GetByte(2), GetByte(1) << 8 | GetByte(0));
+}
+
+std::string CNetAddr::ToString() const
+{
+    return ToStringIP();
+}
+
+bool operator==(const CNetAddr& a, const CNetAddr& b)
+{
+    return (memcmp(a.ip, b.ip, 16) == 0);
+}
+
+bool operator<(const CNetAddr& a, const CNetAddr& b)
+{
+    return (memcmp(a.ip, b.ip, 16) < 0);
+}
+
+bool CNetAddr::GetInAddr(struct in_addr* pipv4Addr) const
+{
+    if (!IsIPv4())
+        return false;
+    memcpy(pipv4Addr, ip+12, 4);
+    return true;
+}
+
+bool CNetAddr::GetIn6Addr(struct in6_addr* pipv6Addr) const
+{
+    if (!IsIPv6()) {
+        return false;
+    }
+    memcpy(pipv6Addr, ip, 16);
+    return true;
+}
+
+//获取地址“组的规范标识符
+//不会尝试对同一组的地址进行两次连接
+std::vector<unsigned char> CNetAddr::GetGroup() const
+{
+    std::vector<unsigned char> vchRet;
+    int nClass = NET_IPV6;
+    int nStartByte = 0;
+    int nBits = 16;
+
+//所有本地地址属于同一组
+    if (IsLocal())
+    {
+        nClass = 255;
+        nBits = 0;
+    }
+//所有内部使用地址都有自己的组
+    if (IsInternal())
+    {
+        nClass = NET_INTERNAL;
+        nStartByte = sizeof(g_internal_prefix);
+        nBits = (sizeof(ip) - sizeof(g_internal_prefix)) * 8;
+    }
+//所有其他无法路由的地址属于同一组
+    else if (!IsRoutable())
+    {
+        nClass = NET_UNROUTABLE;
+        nBits = 0;
+    }
+//对于IPv4地址，“1”+IP的16个高阶位
+//包括映射的IPv4、siit翻译的IPv4和众所周知的前缀
+    else if (IsIPv4() || IsRFC6145() || IsRFC6052())
+    {
+        nClass = NET_IPV4;
+        nStartByte = 12;
+    }
+//对于6to4隧道地址，使用封装的IPv4地址
+    else if (IsRFC3964())
+    {
+        nClass = NET_IPV4;
+        nStartByte = 2;
+    }
+//对于Teredo隧道式IPv6地址，请使用封装的IPv4地址
+    else if (IsRFC4380())
+    {
+        vchRet.push_back(NET_IPV4);
+        vchRet.push_back(GetByte(3) ^ 0xFF);
+        vchRet.push_back(GetByte(2) ^ 0xFF);
+        return vchRet;
+    }
+    else if (IsTor())
+    {
+        nClass = NET_ONION;
+        nStartByte = 6;
+        nBits = 4;
+    }
+//对于he.net，使用/36组
+    else if (GetByte(15) == 0x20 && GetByte(14) == 0x01 && GetByte(13) == 0x04 && GetByte(12) == 0x70)
+        nBits = 36;
+//对于IPv6网络的其余部分，请使用/32组
+    else
+        nBits = 32;
+
+    vchRet.push_back(nClass);
+    while (nBits >= 8)
+    {
+        vchRet.push_back(GetByte(15 - nStartByte));
+        nStartByte++;
+        nBits -= 8;
+    }
+    if (nBits > 0)
+        vchRet.push_back(GetByte(15 - nStartByte) | ((1 << (8 - nBits)) - 1));
+
+    return vchRet;
+}
+
+uint64_t CNetAddr::GetHash() const
+{
+    uint256 hash = Hash(&ip[0], &ip[16]);
+    uint64_t nRet;
+    memcpy(&nRet, &hash, sizeof(nRet));
+    return nRet;
+}
+
+//枚举网络的专用扩展，仅由getextnetwork返回，
+//仅用于从
+static const int NET_UNKNOWN = NET_MAX + 0;
+static const int NET_TEREDO  = NET_MAX + 1;
+int static GetExtNetwork(const CNetAddr *addr)
+{
+    if (addr == nullptr)
+        return NET_UNKNOWN;
+    if (addr->IsRFC4380())
+        return NET_TEREDO;
+    return addr->GetNetwork();
+}
+
+/*计算给定合作伙伴的可达性（*this）的度量值*/
+int CNetAddr::GetReachabilityFrom(const CNetAddr *paddrPartner) const
+{
+    enum Reachability {
+        REACH_UNREACHABLE,
+        REACH_DEFAULT,
+        REACH_TEREDO,
+        REACH_IPV6_WEAK,
+        REACH_IPV4,
+        REACH_IPV6_STRONG,
+        REACH_PRIVATE
+    };
+
+    if (!IsRoutable() || IsInternal())
+        return REACH_UNREACHABLE;
+
+    int ourNet = GetExtNetwork(this);
+    int theirNet = GetExtNetwork(paddrPartner);
+    bool fTunnel = IsRFC3964() || IsRFC6052() || IsRFC6145();
+
+    switch(theirNet) {
+    case NET_IPV4:
+        switch(ourNet) {
+        default:       return REACH_DEFAULT;
+        case NET_IPV4: return REACH_IPV4;
+        }
+    case NET_IPV6:
+        switch(ourNet) {
+        default:         return REACH_DEFAULT;
+        case NET_TEREDO: return REACH_TEREDO;
+        case NET_IPV4:   return REACH_IPV4;
+case NET_IPV6:   return fTunnel ? REACH_IPV6_WEAK : REACH_IPV6_STRONG; //只有在我们的ipv6地址没有隧道的情况下才愿意提供它
+        }
+    case NET_ONION:
+        switch(ourNet) {
+        default:         return REACH_DEFAULT;
+case NET_IPV4:   return REACH_IPV4; //Tor用户也可以连接到IPv4
+        case NET_ONION:    return REACH_PRIVATE;
+        }
+    case NET_TEREDO:
+        switch(ourNet) {
+        default:          return REACH_DEFAULT;
+        case NET_TEREDO:  return REACH_TEREDO;
+        case NET_IPV6:    return REACH_IPV6_WEAK;
+        case NET_IPV4:    return REACH_IPV4;
+        }
+    case NET_UNKNOWN:
+    case NET_UNROUTABLE:
+    default:
+        switch(ourNet) {
+        default:          return REACH_DEFAULT;
+        case NET_TEREDO:  return REACH_TEREDO;
+        case NET_IPV6:    return REACH_IPV6_WEAK;
+        case NET_IPV4:    return REACH_IPV4;
+case NET_ONION:     return REACH_PRIVATE; //或者从Tor来，或者不关心我们的地址
+        }
+    }
+}
+
+CService::CService() : port(0)
+{
+}
+
+CService::CService(const CNetAddr& cip, unsigned short portIn) : CNetAddr(cip), port(portIn)
+{
+}
+
+CService::CService(const struct in_addr& ipv4Addr, unsigned short portIn) : CNetAddr(ipv4Addr), port(portIn)
+{
+}
+
+CService::CService(const struct in6_addr& ipv6Addr, unsigned short portIn) : CNetAddr(ipv6Addr), port(portIn)
+{
+}
+
+CService::CService(const struct sockaddr_in& addr) : CNetAddr(addr.sin_addr), port(ntohs(addr.sin_port))
+{
+    assert(addr.sin_family == AF_INET);
+}
+
+CService::CService(const struct sockaddr_in6 &addr) : CNetAddr(addr.sin6_addr, addr.sin6_scope_id), port(ntohs(addr.sin6_port))
+{
+   assert(addr.sin6_family == AF_INET6);
+}
+
+bool CService::SetSockAddr(const struct sockaddr *paddr)
+{
+    switch (paddr->sa_family) {
+    case AF_INET:
+        *this = CService(*(const struct sockaddr_in*)paddr);
+        return true;
+    case AF_INET6:
+        *this = CService(*(const struct sockaddr_in6*)paddr);
+        return true;
+    default:
+        return false;
+    }
+}
+
+unsigned short CService::GetPort() const
+{
+    return port;
+}
+
+bool operator==(const CService& a, const CService& b)
+{
+    return static_cast<CNetAddr>(a) == static_cast<CNetAddr>(b) && a.port == b.port;
+}
+
+bool operator<(const CService& a, const CService& b)
+{
+    return static_cast<CNetAddr>(a) < static_cast<CNetAddr>(b) || (static_cast<CNetAddr>(a) == static_cast<CNetAddr>(b) && a.port < b.port);
+}
+
+bool CService::GetSockAddr(struct sockaddr* paddr, socklen_t *addrlen) const
+{
+    if (IsIPv4()) {
+        if (*addrlen < (socklen_t)sizeof(struct sockaddr_in))
+            return false;
+        *addrlen = sizeof(struct sockaddr_in);
+        struct sockaddr_in *paddrin = (struct sockaddr_in*)paddr;
+        memset(paddrin, 0, *addrlen);
+        if (!GetInAddr(&paddrin->sin_addr))
+            return false;
+        paddrin->sin_family = AF_INET;
+        paddrin->sin_port = htons(port);
+        return true;
+    }
+    if (IsIPv6()) {
+        if (*addrlen < (socklen_t)sizeof(struct sockaddr_in6))
+            return false;
+        *addrlen = sizeof(struct sockaddr_in6);
+        struct sockaddr_in6 *paddrin6 = (struct sockaddr_in6*)paddr;
+        memset(paddrin6, 0, *addrlen);
+        if (!GetIn6Addr(&paddrin6->sin6_addr))
+            return false;
+        paddrin6->sin6_scope_id = scopeId;
+        paddrin6->sin6_family = AF_INET6;
+        paddrin6->sin6_port = htons(port);
+        return true;
+    }
+    return false;
+}
+
+std::vector<unsigned char> CService::GetKey() const
+{
+     std::vector<unsigned char> vKey;
+     vKey.resize(18);
+     memcpy(vKey.data(), ip, 16);
+     vKey[16] = port / 0x100;
+     vKey[17] = port & 0x0FF;
+     return vKey;
+}
+
+std::string CService::ToStringPort() const
+{
+    return strprintf("%u", port);
+}
+
+std::string CService::ToStringIPPort() const
+{
+    if (IsIPv4() || IsTor() || IsInternal()) {
+        return ToStringIP() + ":" + ToStringPort();
+    } else {
+        return "[" + ToStringIP() + "]:" + ToStringPort();
+    }
+}
+
+std::string CService::ToString() const
+{
+    return ToStringIPPort();
+}
+
+CSubNet::CSubNet():
+    valid(false)
+{
+    memset(netmask, 0, sizeof(netmask));
+}
+
+CSubNet::CSubNet(const CNetAddr &addr, int32_t mask)
+{
+    valid = true;
+    network = addr;
+//默认为/32（IPv4）或/128（IPv6），即匹配单个地址
+    memset(netmask, 255, sizeof(netmask));
+
+//IPv4地址从偏移量12开始，前12个字节必须匹配，因此只需偏移量n
+    const int astartofs = network.IsIPv4() ? 12 : 0;
+
+    int32_t n = mask;
+if(n >= 0 && n <= (128 - astartofs*8)) //仅在地址位范围内有效
+    {
+        n += astartofs*8;
+//清除位[N..127]
+        for (; n < 128; ++n)
+            netmask[n>>3] &= ~(1<<(7-(n&7)));
+    } else
+        valid = false;
+
+//根据网络掩码规范化网络
+    for(int x=0; x<16; ++x)
+        network.ip[x] &= netmask[x];
+}
+
+CSubNet::CSubNet(const CNetAddr &addr, const CNetAddr &mask)
+{
+    valid = true;
+    network = addr;
+//默认为/32（IPv4）或/128（IPv6），即匹配单个地址
+    memset(netmask, 255, sizeof(netmask));
+
+//IPv4地址从偏移量12开始，前12个字节必须匹配，因此只需偏移量n
+    const int astartofs = network.IsIPv4() ? 12 : 0;
+
+    for(int x=astartofs; x<16; ++x)
+        netmask[x] = mask.ip[x];
+
+//根据网络掩码规范化网络
+    for(int x=0; x<16; ++x)
+        network.ip[x] &= netmask[x];
+}
+
+CSubNet::CSubNet(const CNetAddr &addr):
+    valid(addr.IsValid())
+{
+    memset(netmask, 255, sizeof(netmask));
+    network = addr;
+}
+
+bool CSubNet::Match(const CNetAddr &addr) const
+{
+    if (!valid || !addr.IsValid())
+        return false;
+    for(int x=0; x<16; ++x)
+        if ((addr.ip[x] & netmask[x]) != network.ip[x])
+            return false;
+    return true;
+}
+
+static inline int NetmaskBits(uint8_t x)
+{
+    switch(x) {
+    case 0x00: return 0;
+    case 0x80: return 1;
+    case 0xc0: return 2;
+    case 0xe0: return 3;
+    case 0xf0: return 4;
+    case 0xf8: return 5;
+    case 0xfc: return 6;
+    case 0xfe: return 7;
+    case 0xff: return 8;
+    default: return -1;
+    }
+}
+
+std::string CSubNet::ToString() const
+{
+    /*分析二进制1 n 0 n-n查看掩码是否可以表示为/n*/
+    int cidr = 0;
+    bool valid_cidr = true;
+    int n = network.IsIPv4() ? 12 : 0;
+    for (; n < 16 && netmask[n] == 0xff; ++n)
+        cidr += 8;
+    if (n < 16) {
+        int bits = NetmaskBits(netmask[n]);
+        if (bits < 0)
+            valid_cidr = false;
+        else
+            cidr += bits;
+        ++n;
+    }
+    for (; n < 16 && valid_cidr; ++n)
+        if (netmask[n] != 0x00)
+            valid_cidr = false;
+
+    /*格式输出*/
+    std::string strNetmask;
+    if (valid_cidr) {
+        strNetmask = strprintf("%u", cidr);
+    } else {
+        if (network.IsIPv4())
+            strNetmask = strprintf("%u.%u.%u.%u", netmask[12], netmask[13], netmask[14], netmask[15]);
+        else
+            strNetmask = strprintf("%x:%x:%x:%x:%x:%x:%x:%x",
+                             netmask[0] << 8 | netmask[1], netmask[2] << 8 | netmask[3],
+                             netmask[4] << 8 | netmask[5], netmask[6] << 8 | netmask[7],
+                             netmask[8] << 8 | netmask[9], netmask[10] << 8 | netmask[11],
+                             netmask[12] << 8 | netmask[13], netmask[14] << 8 | netmask[15]);
+    }
+
+    return network.ToString() + "/" + strNetmask;
+}
+
+bool CSubNet::IsValid() const
+{
+    return valid;
+}
+
+bool operator==(const CSubNet& a, const CSubNet& b)
+{
+    return a.valid == b.valid && a.network == b.network && !memcmp(a.netmask, b.netmask, 16);
+}
+
+bool operator<(const CSubNet& a, const CSubNet& b)
+{
+    return (a.network < b.network || (a.network == b.network && memcmp(a.netmask, b.netmask, 16) < 0));
+}
